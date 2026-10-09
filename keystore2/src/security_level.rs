@@ -14,6 +14,9 @@
 
 //! This crate implements the IKeystoreSecurityLevel interface.
 
+use crate::attestation_compat::{
+    generate_software_key_for_uid, is_simulated_blob, strip_simulated_blob,
+};
 use crate::attestation_key_utils::{get_attest_key_info, AttestationKeyInfo};
 use crate::audit_log::{
     log_key_deleted, log_key_generated, log_key_imported, log_key_integrity_violation,
@@ -22,9 +25,11 @@ use crate::database::{BlobInfo, CertificateInfo, KeyIdGuard};
 use crate::error::{
     self, into_logged_binder, map_km_error, wrapped_rkpd_error_to_ks_error, Error, ErrorCode,
 };
+use crate::globals::get_keymint_device;
 use crate::globals::{
     get_remotely_provisioned_component_name, DB, ENFORCEMENTS, LEGACY_IMPORTER, SUPER_KEY,
 };
+use crate::id_rotation::IdRotationState;
 use crate::key_parameter::KeyParameterValue as KsKeyParamValue;
 use crate::key_parameter::{KeyParameter as KsKeyParam, KmKeyParameter};
 use crate::ks_err;
@@ -50,11 +55,10 @@ use crate::{
     operation::OperationDb,
     permission::KeyPerm,
 };
-use crate::{globals::get_keymint_device, id_rotation::IdRotationState};
 use android_hardware_security_keymint::aidl::android::hardware::security::keymint::{
     Algorithm::Algorithm, AttestationKey::AttestationKey, Certificate::Certificate,
-    HardwareAuthenticatorType::HardwareAuthenticatorType, IKeyMintDevice::IKeyMintDevice,
-    KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
+    EcCurve::EcCurve, HardwareAuthenticatorType::HardwareAuthenticatorType,
+    IKeyMintDevice::IKeyMintDevice, KeyCreationResult::KeyCreationResult, KeyFormat::KeyFormat,
     KeyMintHardwareInfo::KeyMintHardwareInfo, KeyOrigin::KeyOrigin, KeyParameter::KeyParameter,
     KeyParameterValue::KeyParameterValue, SecurityLevel::SecurityLevel, Tag::Tag,
 };
@@ -68,7 +72,7 @@ use android_system_keystore2::aidl::android::system::keystore2::{
     KeyMetadata::KeyMetadata, KeyParameters::KeyParameters, ResponseCode::ResponseCode,
 };
 use anyhow::{anyhow, Context, Result};
-use log::error;
+use log::{error, info, warn};
 use postprocessor_client::process_certificate_chain;
 use rkpd_client::store_rkpd_attestation_key;
 use rustutils::android::system_properties::read_bool;
@@ -94,6 +98,30 @@ pub struct KeystoreSecurityLevel {
 
 // Blob of 32 zeroes used as empty masking key.
 static ZERO_BLOB_32: &[u8] = &[0; 32];
+static DEFAULT_CERT_SUBJECT_DER: &[u8] = &[
+    // Name ::= SEQUENCE { RDNSequence }, CN=Android Keystore Key
+    0x30, 0x1f, 0x31, 0x1d, 0x30, 0x1b, 0x06, 0x03, 0x55, 0x04, 0x03, 0x0c, 0x14, 0x41, 0x6e, 0x64,
+    0x72, 0x6f, 0x69, 0x64, 0x20, 0x4b, 0x65, 0x79, 0x73, 0x74, 0x6f, 0x72, 0x65, 0x20, 0x4b, 0x65,
+    0x79,
+];
+
+fn derive_ec_key_size_from_curve(params: &[KeyParameter]) -> Option<i32> {
+    let curve = params.iter().find_map(|kp| {
+        if kp.tag == Tag::EC_CURVE {
+            if let KeyParameterValue::EcCurve(c) = kp.value {
+                return Some(c);
+            }
+        }
+        None
+    })?;
+    match curve {
+        EcCurve::P_224 => Some(224),
+        EcCurve::P_256 | EcCurve::CURVE_25519 => Some(256),
+        EcCurve::P_384 => Some(384),
+        EcCurve::P_521 => Some(521),
+        _ => None,
+    }
+}
 
 impl KeystoreSecurityLevel {
     /// Creates a new security level instance wrapped in a
@@ -345,41 +373,62 @@ impl KeystoreSecurityLevel {
             .unwrap_key_if_required(&blob_metadata, km_blob)
             .context(ks_err!("Failed to handle super encryption."))?;
 
+        let is_simulated = is_simulated_blob(&km_blob);
+        let soft_keymint_device = if is_simulated {
+            match get_keymint_device(&SecurityLevel::SOFTWARE) {
+                Ok((dev, _, _)) => Some(dev),
+                Err(e) => {
+                    warn!("Failed to obtain software keymint device for simulated key operation: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let (begin_result, upgraded_blob) = self
             .upgrade_keyblob_if_required_with(
                 key_id_guard,
                 &km_blob,
                 blob_metadata.km_uuid().copied(),
                 operation_parameters,
-                |blob| loop {
-                    match map_km_error({
-                        let _wp = self.watch(
-                            "KeystoreSecurityLevel::create_operation: calling IKeyMintDevice::begin",
-                        );
-                        self.keymint.begin(
-                            purpose,
-                            blob,
-                            operation_parameters,
-                            immediate_hat.as_ref(),
-                        )
-                    }) {
-                        Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
-                            self.operation_db.prune(caller_uid, forced)?;
-                            continue;
-                        }
-                        v @ Err(Error::Km(ErrorCode::INVALID_KEY_BLOB)) => {
-                            if let Some((key_id, _)) = key_properties {
-                                if let Ok(Some(key)) =
-                                    DB.with(|db| db.borrow_mut().load_key_descriptor(key_id))
-                                {
-                                    log_key_integrity_violation(&key);
-                                } else {
-                                    error!("Failed to load key descriptor for audit log");
-                                }
+                |blob| {
+                    let actual_blob = if is_simulated {
+                        strip_simulated_blob(blob)
+                    } else {
+                        blob
+                    };
+                    let target_km = soft_keymint_device.as_ref().unwrap_or(&self.keymint);
+                    loop {
+                        match map_km_error({
+                            let _wp = self.watch(
+                                "KeystoreSecurityLevel::create_operation: calling IKeyMintDevice::begin",
+                            );
+                            target_km.begin(
+                                purpose,
+                                actual_blob,
+                                operation_parameters,
+                                immediate_hat.as_ref(),
+                            )
+                        }) {
+                            Err(Error::Km(ErrorCode::TOO_MANY_OPERATIONS)) => {
+                                self.operation_db.prune(caller_uid, forced)?;
+                                continue;
                             }
-                            return v;
+                            v @ Err(Error::Km(ErrorCode::INVALID_KEY_BLOB)) => {
+                                if let Some((key_id, _)) = key_properties {
+                                    if let Ok(Some(key)) =
+                                        DB.with(|db| db.borrow_mut().load_key_descriptor(key_id))
+                                    {
+                                        log_key_integrity_violation(&key);
+                                    } else {
+                                        error!("Failed to load key descriptor for audit log");
+                                    }
+                                }
+                                return v;
+                            }
+                            v => return v,
                         }
-                        v => return v,
                     }
                 },
             )
@@ -540,6 +589,12 @@ impl KeystoreSecurityLevel {
                 tag: _,
                 value: KeyParameterValue::Algorithm(Algorithm::ML_DSA),
             }) => {
+                if !params.iter().any(|kp| kp.tag == Tag::CERTIFICATE_SUBJECT) {
+                    result.push(KeyParameter {
+                        tag: Tag::CERTIFICATE_SUBJECT,
+                        value: KeyParameterValue::Blob(DEFAULT_CERT_SUBJECT_DER.to_vec()),
+                    })
+                }
                 if !params.iter().any(|kp| kp.tag == Tag::CERTIFICATE_NOT_BEFORE) {
                     result.push(KeyParameter {
                         tag: Tag::CERTIFICATE_NOT_BEFORE,
@@ -551,6 +606,30 @@ impl KeystoreSecurityLevel {
                         tag: Tag::CERTIFICATE_NOT_AFTER,
                         value: KeyParameterValue::DateTime(UNDEFINED_NOT_AFTER),
                     })
+                }
+                if params.iter().any(|kp| {
+                    kp.tag == Tag::ALGORITHM
+                        && matches!(kp.value, KeyParameterValue::Algorithm(Algorithm::RSA))
+                }) && !params.iter().any(|kp| kp.tag == Tag::RSA_PUBLIC_EXPONENT)
+                {
+                    // Match AOSP Java-side default: RSAKeyGenParameterSpec.F4 (65537).
+                    result.push(KeyParameter {
+                        tag: Tag::RSA_PUBLIC_EXPONENT,
+                        value: KeyParameterValue::LongInteger(65537),
+                    })
+                }
+                if !params.iter().any(|kp| kp.tag == Tag::KEY_SIZE)
+                    && params.iter().any(|kp| {
+                        kp.tag == Tag::ALGORITHM
+                            && matches!(kp.value, KeyParameterValue::Algorithm(Algorithm::EC))
+                    })
+                {
+                    if let Some(size) = derive_ec_key_size_from_curve(params) {
+                        result.push(KeyParameter {
+                            tag: Tag::KEY_SIZE,
+                            value: KeyParameterValue::Integer(size),
+                        })
+                    }
                 }
             }
             _ => {}
@@ -710,6 +789,10 @@ impl KeystoreSecurityLevel {
         // Must return on error for security reasons.
         check_key_permission(KeyPerm::Rebind, &key, &None).context(ks_err!())?;
 
+        let params = self
+            .add_required_parameters(caller_uid, params, &key)
+            .context(ks_err!("Trying to get aaid."))?;
+
         let attestation_key_info = match (key.domain, attest_key_descriptor) {
             (Domain::BLOB, _) => None,
             _ => DB
@@ -718,18 +801,15 @@ impl KeystoreSecurityLevel {
                         &key,
                         caller_uid,
                         attest_key_descriptor,
-                        params,
+                        &params,
                         &self.rem_prov_state,
                         &mut db.borrow_mut(),
                     )
                 })
                 .context(ks_err!("Trying to get an attestation key"))?,
         };
-        let params = self
-            .add_required_parameters(caller_uid, params, &key)
-            .context(ks_err!("Trying to get aaid."))?;
 
-        let creation_result = match attestation_key_info {
+        let hardware_attempt = match attestation_key_info {
             Some(AttestationKeyInfo::UserGenerated {
                 key_id_guard,
                 blob,
@@ -750,11 +830,6 @@ impl KeystoreSecurityLevel {
                         self.generate_key_and_retry_on_att_id_mismatch(&params, attest_key.as_ref())
                     },
                 )
-                .context(ks_err!(
-                    "While generating with a user-generated \
-                      attestation key, params: {:?}.",
-                    log_security_safe_params(&params)
-                ))
                 .map(|(result, _)| result),
             Some(AttestationKeyInfo::RkpdProvisioned { attestation_key, attestation_certs }) => {
                 self.upgrade_rkpd_keyblob_if_required_with(&attestation_key.keyBlob, &[], |blob| {
@@ -768,12 +843,6 @@ impl KeystoreSecurityLevel {
                         dynamic_attest_key.as_ref(),
                     )
                 })
-                .context(ks_err!(
-                    "While generating Key {:?} with remote \
-                    provisioned attestation key and params: {:?}.",
-                    key.alias,
-                    log_security_safe_params(&params)
-                ))
                 .map(|(mut result, _)| {
                     if read_bool("remote_provisioning.use_cert_processor", false).unwrap_or(false) {
                         let _wp = self.watch_millis(
@@ -807,8 +876,27 @@ impl KeystoreSecurityLevel {
                  attestation key and params: {:?}.",
                 log_security_safe_params(&params)
             )),
-        }
-        .context(ks_err!())?;
+        };
+
+        let creation_result = match hardware_attempt {
+            Ok(result) => result,
+            Err(hw_err) => {
+                info!(
+                    "Hardware key generation failed ({:?}); attempting software key generation for uid {:?}",
+                    hw_err, caller_uid
+                );
+                match generate_software_key_for_uid(caller_uid, &params) {
+                    Some(sw_result) => sw_result,
+                    None => {
+                        return Err(hw_err).context(ks_err!(
+                            "While generating Key {:?} with params: {:?}.",
+                            key.alias,
+                            log_security_safe_params(&params)
+                        ))
+                    }
+                }
+            }
+        };
 
         let user = caller_uid.owning_user();
         self.store_new_key(key, creation_result, user, Some(flags)).context(ks_err!())
