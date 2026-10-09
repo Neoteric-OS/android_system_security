@@ -19,10 +19,11 @@ mod error;
 pub mod zvec;
 pub use error::Error;
 use keystore2_crypto_bindgen::{
-    extractSubjectFromCertificate, hmacSha256, randomBytes, AES_gcm_decrypt, AES_gcm_encrypt,
-    ECDHComputeKey, ECKEYGenerateKey, ECKEYMarshalPrivateKey, ECKEYParsePrivateKey,
-    ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free, EC_KEY_get0_public_key, EC_POINT_free,
-    HKDFExpand, HKDFExtract, EC_KEY, EC_POINT, EVP_MAX_MD_SIZE, PBKDF2,
+    extractSubjectFromCertificate, generateSoftwareAttestedKey, getSoftwareRootCertDer, hmacSha256,
+    randomBytes, AES_gcm_decrypt, AES_gcm_encrypt, ECDHComputeKey, ECKEYGenerateKey,
+    ECKEYMarshalPrivateKey, ECKEYParsePrivateKey, ECPOINTOct2Point, ECPOINTPoint2Oct, EC_KEY_free,
+    EC_KEY_get0_public_key, EC_POINT_free, HKDFExpand, HKDFExtract, EC_KEY, EC_POINT,
+    EVP_MAX_MD_SIZE, PBKDF2,
 };
 use std::convert::TryFrom;
 use std::convert::TryInto;
@@ -501,6 +502,94 @@ pub fn parse_subject_from_certificate(cert_buf: &[u8]) -> Result<Vec<u8>, Error>
     retval.truncate(safe_size);
 
     Ok(retval)
+}
+
+/// Returns the DER-encoded software root certificate.
+pub fn software_root_cert_der() -> Result<Vec<u8>, Error> {
+    let mut cert_buf = vec![0u8; 4096];
+    // Safety: getSoftwareRootCertDer writes at most the capacity to cert_buf.
+    let mut size = unsafe { getSoftwareRootCertDer(cert_buf.as_mut_ptr(), cert_buf.len()) };
+    if size == 0 {
+        return Err(Error::GenerateKeyFailed);
+    }
+    if size < 0 {
+        let needed = usize::try_from(-size).map_err(|_| Error::GenerateKeyFailed)?;
+        cert_buf = vec![0u8; needed];
+        // Safety: getSoftwareRootCertDer writes at most the capacity to cert_buf.
+        size = unsafe { getSoftwareRootCertDer(cert_buf.as_mut_ptr(), cert_buf.len()) };
+        if size <= 0 {
+            return Err(Error::GenerateKeyFailed);
+        }
+    }
+    cert_buf.truncate(size as usize);
+    Ok(cert_buf)
+}
+
+/// Generates a software-backed key and attestation certificate.
+///
+/// Returns `(pkcs8_private_key, der_certificate)`.
+pub fn generate_software_attested_key(
+    key_type: i32,
+    rsa_key_size: i32,
+    challenge: &[u8],
+    attest_app_id: &[u8],
+    is_attest_key: bool,
+) -> Result<(Vec<u8>, Vec<u8>), Error> {
+    let mut privkey_buf = vec![0u8; 4096];
+    let mut privkey_len: usize = 0;
+    let mut cert_buf = vec![0u8; 4096];
+
+    // Safety: generateSoftwareAttestedKey reads at most input lengths from inputs and writes at most
+    // buffer capacities to privkey_buf and cert_buf.
+    let mut size = unsafe {
+        generateSoftwareAttestedKey(
+            key_type,
+            rsa_key_size,
+            challenge.as_ptr(),
+            challenge.len(),
+            attest_app_id.as_ptr(),
+            attest_app_id.len(),
+            if is_attest_key { 1 } else { 0 },
+            privkey_buf.as_mut_ptr(),
+            privkey_buf.len(),
+            &mut privkey_len,
+            cert_buf.as_mut_ptr(),
+            cert_buf.len(),
+        )
+    };
+
+    if size == 0 {
+        return Err(Error::GenerateKeyFailed);
+    }
+
+    if size < 0 {
+        let needed = usize::try_from(-size).map_err(|_| Error::GenerateKeyFailed)?;
+        cert_buf = vec![0u8; needed];
+        // Safety: Same as above with resized output buffer.
+        size = unsafe {
+            generateSoftwareAttestedKey(
+                key_type,
+                rsa_key_size,
+                challenge.as_ptr(),
+                challenge.len(),
+                attest_app_id.as_ptr(),
+                attest_app_id.len(),
+                if is_attest_key { 1 } else { 0 },
+                privkey_buf.as_mut_ptr(),
+                privkey_buf.len(),
+                &mut privkey_len,
+                cert_buf.as_mut_ptr(),
+                cert_buf.len(),
+            )
+        };
+        if size <= 0 {
+            return Err(Error::GenerateKeyFailed);
+        }
+    }
+
+    privkey_buf.truncate(privkey_len);
+    cert_buf.truncate(size as usize);
+    Ok((privkey_buf, cert_buf))
 }
 
 #[cfg(test)]

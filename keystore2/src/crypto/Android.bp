@@ -50,6 +50,7 @@ cc_library {
     ],
     export_include_dirs: ["include"],
     shared_libs: [
+        "libbase",
         "libcrypto",
         "liblog",
     ],
@@ -85,6 +86,8 @@ rust_bindgen {
         "--allowlist-function=HKDFExtract",
         "--allowlist-function=PBKDF2",
         "--allowlist-function=extractSubjectFromCertificate",
+        "--allowlist-function=generateSoftwareAttestedKey",
+        "--allowlist-function=getSoftwareRootCertDer",
         "--allowlist-function=hmacSha256",
         "--allowlist-function=randomBytes",
         "--allowlist-type=EC_KEY",

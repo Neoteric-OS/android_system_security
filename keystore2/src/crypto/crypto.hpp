@@ -18,50 +18,46 @@
 #define __CRYPTO_H__
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 extern "C" {
-  bool hmacSha256(const uint8_t* key, size_t key_size, const uint8_t* msg, size_t msg_size,
-                  uint8_t* out, size_t out_size);
-  bool randomBytes(uint8_t* out, size_t len);
-  bool AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len,
-                       const uint8_t* key, size_t key_size, const uint8_t* iv, uint8_t* tag);
-  bool AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len,
-                       const uint8_t* key, size_t key_size, const uint8_t* iv,
-                       const uint8_t* tag);
+bool hmacSha256(const uint8_t* key, size_t key_size, const uint8_t* msg, size_t msg_size,
+                uint8_t* out, size_t out_size);
+bool randomBytes(uint8_t* out, size_t len);
+bool AES_gcm_encrypt(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key,
+                     size_t key_size, const uint8_t* iv, uint8_t* tag);
+bool AES_gcm_decrypt(const uint8_t* in, uint8_t* out, size_t len, const uint8_t* key,
+                     size_t key_size, const uint8_t* iv, const uint8_t* tag);
 
-  // Copied from system/security/keystore/keymaster_enforcement.h.
-  typedef uint64_t km_id_t;
+// Copied from system/security/keystore/keymaster_enforcement.h.
+typedef uint64_t km_id_t;
 
-  bool CreateKeyId(const uint8_t* key_blob, size_t len, km_id_t* out_id);
+bool CreateKeyId(const uint8_t* key_blob, size_t len, km_id_t* out_id);
 
-  // The salt parameter must be non-nullptr and point to 16 bytes of data.
-  void PBKDF2(uint8_t* key, size_t key_len, const char* pw, size_t pw_len, const uint8_t* salt);
+// The salt parameter must be non-nullptr and point to 16 bytes of data.
+void PBKDF2(uint8_t* key, size_t key_len, const char* pw, size_t pw_len, const uint8_t* salt);
 
-  #include "openssl/digest.h"
-  #include "openssl/ec_key.h"
+#include "openssl/digest.h"
+#include "openssl/ec_key.h"
 
-  bool HKDFExtract(uint8_t *out_key, size_t *out_len,
-                   const uint8_t *secret, size_t secret_len,
-                   const uint8_t *salt, size_t salt_len);
+bool HKDFExtract(uint8_t* out_key, size_t* out_len, const uint8_t* secret, size_t secret_len,
+                 const uint8_t* salt, size_t salt_len);
 
-  bool HKDFExpand(uint8_t *out_key, size_t out_len,
-                  const uint8_t *prk, size_t prk_len,
-                  const uint8_t *info, size_t info_len);
+bool HKDFExpand(uint8_t* out_key, size_t out_len, const uint8_t* prk, size_t prk_len,
+                const uint8_t* info, size_t info_len);
 
-  int ECDHComputeKey(void *out, size_t out_len, const EC_POINT *pub_key, const EC_KEY *priv_key);
+int ECDHComputeKey(void* out, size_t out_len, const EC_POINT* pub_key, const EC_KEY* priv_key);
 
-  EC_KEY* ECKEYGenerateKey();
+EC_KEY* ECKEYGenerateKey();
 
-  size_t ECKEYMarshalPrivateKey(const EC_KEY *priv_key, uint8_t *buf, size_t len);
+size_t ECKEYMarshalPrivateKey(const EC_KEY* priv_key, uint8_t* buf, size_t len);
 
-  EC_KEY* ECKEYParsePrivateKey(const uint8_t *buf, size_t len);
+EC_KEY* ECKEYParsePrivateKey(const uint8_t* buf, size_t len);
 
-  size_t ECPOINTPoint2Oct(const EC_POINT *point, uint8_t *buf, size_t len);
+size_t ECPOINTPoint2Oct(const EC_POINT* point, uint8_t* buf, size_t len);
 
-  EC_POINT* ECPOINTOct2Point(const uint8_t *buf, size_t len);
-
+EC_POINT* ECPOINTOct2Point(const uint8_t* buf, size_t len);
 }
 
 // Parse a DER-encoded X.509 certificate contained in cert_buf, with length
@@ -83,7 +79,28 @@ extern "C" {
 // subject_buf_len.  The return value is -(subject_size), where subject_size is
 // the size of the extracted DER-encoded subject field.  Call
 // extractSubjectFromCertificate again with a sufficiently-large buffer.
-int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len,
-                                  uint8_t* subject_buf, size_t subject_buf_len);
+int extractSubjectFromCertificate(const uint8_t* cert_buf, size_t cert_len, uint8_t* subject_buf,
+                                  size_t subject_buf_len);
+
+// Return DER-encoded software root CA certificate.
+// Return value: > 0 (cert length on success), 0 on failure, < 0 if buffer too small (-needed)
+int getSoftwareRootCertDer(uint8_t* out_cert_buf, size_t out_cert_buf_len);
+
+// Generate a software-backed key and signed attestation certificate.
+// key_type: 1 = RSA, 2 = EC (NIST P-256)
+// rsa_key_size: e.g. 2048
+// challenge: attestation challenge bytes
+// attest_app_id_buf, attest_app_id_len: caller AttestationApplicationId (DER)
+// is_attest_key: whether KeyPurpose::ATTEST_KEY is requested
+// out_privkey_buf, out_privkey_buf_len: buffer to receive PKCS#8 private key
+// out_privkey_len: written length of PKCS#8 private key
+// out_cert_buf, out_cert_buf_len: buffer to receive DER X.509 certificate
+// Return value: > 0 (cert length on success), 0 on failure, < 0 if cert buffer too small (-needed)
+int generateSoftwareAttestedKey(int key_type, int rsa_key_size, const uint8_t* challenge,
+                                size_t challenge_len, const uint8_t* attest_app_id_buf,
+                                size_t attest_app_id_len, int is_attest_key,
+                                uint8_t* out_privkey_buf, size_t out_privkey_buf_len,
+                                size_t* out_privkey_len, uint8_t* out_cert_buf,
+                                size_t out_cert_buf_len);
 
 #endif  //  __CRYPTO_H__
